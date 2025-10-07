@@ -1,37 +1,40 @@
 import logging
-from fastapi import FastAPI
-import inngest
-import inngest.fast_api
-from inngest.experimental import ai
-from dotenv import load_dotenv
 import uuid
 import os
 import datetime
-from data_loader import load_and_chunk_pdf,embed_texts
-from vector_db import QdrantStorage
-from custom_types import *
+from fastapi import FastAPI
+from dotenv import load_dotenv
+
+import inngest
+import inngest.fast_api
+
 import google.generativeai as genai
 
-# env 
+from data_loader import load_and_chunk_pdf, embed_texts
+from vector_db import QdrantStorage
+from custom_types import RAQQueryResult, RAGSearchResult, RAGUpsertResult, RAGChunkAndSrc
+
+# Load .env variables
 load_dotenv()
 
-# Ingest client
+# Configure Google Generative AI
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+
+# Initialize Inngest client
 inngest_client = inngest.Inngest(
-    app_id="rag_the_researcher",
+    app_id="rag_app",
     logger=logging.getLogger("uvicorn"),
     is_production=False,
     serializer=inngest.PydanticSerializer()
 )
 
-
-# Create an Inngest function
+# Inngest function to ingest PDF
 @inngest_client.create_function(
-    fn_id="Rag: Ingest Pdf",
-    # Event that triggers this function
-    trigger=inngest.TriggerEvent(event="rag/ingest_pdf"),
+    fn_id="RAG: Ingest PDF",
+    trigger=inngest.TriggerEvent(event="rag/ingest_pdf")
 )
 async def rag_ingest_pdf(ctx: inngest.Context):
-    def _load(ctx:inngest.Context):
+    def _load(ctx: inngest.Context) -> RAGChunkAndSrc:
         pdf_path = ctx.event.data["pdf_path"]
         source_id = ctx.event.data.get("source_id", pdf_path)
         chunks = load_and_chunk_pdf(pdf_path)
@@ -50,53 +53,43 @@ async def rag_ingest_pdf(ctx: inngest.Context):
     ingested = await ctx.step.run("embed-and-upsert", lambda: _upsert(chunks_and_src), output_type=RAGUpsertResult)
     return ingested.model_dump()
 
+# Inngest function to query PDF with Gemini
+@inngest_client.create_function(
+    fn_id="RAG: Query PDF",
+    trigger=inngest.TriggerEvent(event="rag/query_pdf_ai")
+)
 async def rag_query_pdf_ai(ctx: inngest.Context):
-    # Inner search function for vector DB
     def _search(question: str, top_k: int = 5) -> RAGSearchResult:
-        query_vec = embed_texts([question])[0]  # Use Gemini's embedding model here
+        query_vec = embed_texts([question])[0]
         store = QdrantStorage()
         found = store.search(query_vec, top_k)
         return RAGSearchResult(contexts=found["contexts"], sources=found["sources"])
 
-    # Extract data from event
     question = ctx.event.data["question"]
     top_k = int(ctx.event.data.get("top_k", 5))
 
-    # Run the search step
-    found = await ctx.step.run(
-        "embed-and-search",
-        lambda: _search(question, top_k),
-        output_type=RAGSearchResult
-    )
+    found = await ctx.step.run("embed-and-search", lambda: _search(question, top_k), output_type=RAGSearchResult)
 
-    # Format the context into a message
     context_block = "\n\n".join(f"- {c}" for c in found.contexts)
-    user_content = (
+    prompt = (
         "Use the following context to answer the question.\n\n"
         f"Context:\n{context_block}\n\n"
         f"Question: {question}\n"
-        "Answer concisely using the context above."
+        "Answer concisely using only the context above."
     )
 
-    # Gemini Pro model for chat (text generation)
-    model = genai.GenerativeModel("gemini-pro")
+    # Call Gemini model via Google Generative AI SDK
+    def _ask_gemini(prompt: str) -> str:
+        model = genai.GenerativeModel("gemini-1.5-pro")
+        response = model.generate_content(prompt)
+        return response.text.strip()
 
-    # Run the LLM inference
-    response = await ctx.step.run("llm-answer", lambda: model.generate_content([
-        {"role": "user", "parts": [user_content]}
-    ]))
+    answer = await ctx.step.run("llm-answer", lambda: _ask_gemini(prompt), output_type=str)
 
-    # Extract and return the final answer
-    answer = response.text.strip()
-    return {
-        "answer": answer,
-        "sources": found.sources,
-        "num_contexts": len(found.contexts)
-    }
+    return {"answer": answer, "sources": found.sources, "num_contexts": len(found.contexts)}
 
+# FastAPI app and Inngest setup
+app = FastAPI()
 
-app=FastAPI()
-
-# Serve the Inngest endpoint
-inngest.fast_api.serve(app, inngest_client, [rag_query_pdf_ai,rag_ingest_pdf])
-
+# Serve Inngest functions
+inngest.fast_api.serve(app, inngest_client, [rag_ingest_pdf, rag_query_pdf_ai])
